@@ -1,0 +1,7 @@
+compute_environment: LOCAL_MACHINE
+distributed_type: MULTI_GPU
+num_processes: 4  # 对应4张4090
+gpu_ids: [0,1,2,3]
+main_process_port: 29500
+mixed_precision: fp16  # 4090用fp16平衡速度和显存
+use_cpu: false
