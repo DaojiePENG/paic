@@ -93,18 +93,41 @@ model = None
 processor = None
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
-# ====================== 模型加载函数（终极兼容版）======================
+# ====================== 模型加载函数（适配MoE架构）======================
 def load_model():
     global model, processor
     
-    # 1. 动态导入必要的类（避免版本问题）
-    try:
-        from transformers import Qwen3VLForConditionalGeneration, AutoProcessor
-    except ImportError:
-        from qwen_vl.modeling_qwen import Qwen3VLForConditionalGeneration
-        from qwen_vl.processing_qwen_vl import Qwen3VLProcessor as AutoProcessor
+    # 1. 动态导入必要的类（优先导入MoE版本，兼容普通版本）
+    # 如果是MoE模型，则导入MoE类，否则导入普通类
     
-    # 2. 加载处理器（最基础方式）
+    # 判断是否为 MoE 模型：包含 "moe"（不区分大小写）或符合 A{*}B 模式（如 A3B, A10B）
+    def is_moe_model_name(model_name: str) -> bool:
+        if "moe" in model_name.lower():
+            return True
+        # 匹配 A + 任意数字 + B 的模式，前后可有其他字符（如 30B-A3B-Instruct）
+        if re.search(r"A\d+B", model_name):
+            return True
+        return False
+
+    if is_moe_model_name(MODEL_NAME):
+        # 优先导入MoE版本的模型类（适配30B-A3B-Instruct）
+        from transformers import Qwen3VLMoeForConditionalGeneration  as AutoModelClass
+        from transformers import AutoProcessor
+        # 标记是否为MoE模型
+        is_moe_model = is_moe_model_name(MODEL_NAME)
+    else:
+        # 备用：导入普通版本（兼容2B/7B等非MoE模型）
+        # from transformers import Qwen3VLForConditionalGeneration as Qwen3VLMoeForConditionalGeneration
+        # from transformers import AutoProcessor
+        # is_moe_model = is_moe_model_name(MODEL_NAME)
+        try:
+            from transformers import Qwen3VLForConditionalGeneration as AutoModelClass
+            from transformers import AutoProcessor
+        except ImportError:
+            from qwen_vl.modeling_qwen import Qwen3VLForConditionalGeneration as AutoModelClass
+            from qwen_vl.processing_qwen_vl import Qwen3VLProcessor as AutoProcessor
+    
+    # 2. 加载处理器（保持原有逻辑，使用官方推荐的AutoProcessor）
     try:
         processor = AutoProcessor.from_pretrained(MODEL_NAME, use_fast=False)
     except Exception as e:
@@ -126,37 +149,48 @@ def load_model():
     max_memory["cpu"] = "32GiB"
     print(f"检测到{num_gpus}张GPU，内存配置: {max_memory}")
     
-    # 4. 直接加载模型（使用最基础的方式，避开from_config/_from_config）
+    # 4. 加载模型（适配MoE架构，沿用官方推荐参数）
     try:
-        # 方式1：直接加载（推荐）
-        model = Qwen3VLForConditionalGeneration.from_pretrained(
+        # 方式1：MoE模型优先加载（官方推荐方式）
+        model_kwargs = {
+            "dtype": "auto",  # 自动匹配精度（替代原float16，更适配MoE）
+            "device_map": DEVICE_MAP,
+            "max_memory": max_memory,
+            "trust_remote_code": True,
+            # 可选：开启flash attention 2（需安装flash-attn）
+            # "attn_implementation": "flash_attention_2",
+        }
+        # MoE模型专用加载
+        model = AutoModelClass.from_pretrained(
             MODEL_NAME,
-            dtype=torch.float16,
-            device_map=DEVICE_MAP,
-            max_memory=max_memory,
-            trust_remote_code=True
+            **model_kwargs
         )
+        print(f"成功加载MoE架构模型: {MODEL_NAME}")
     except Exception as e:
-        print(f"直接加载模型失败，尝试备用方案: {e}")
-        # 方式2：备用方案（适配旧版transformers）
-        from accelerate import load_checkpoint_and_dispatch, init_empty_weights
-        
-        # 先获取配置
-        config = Qwen3VLForConditionalGeneration.config_class.from_pretrained(MODEL_NAME)
-        
-        # 初始化空模型
-        with init_empty_weights():
-            model = Qwen3VLForConditionalGeneration(config)
-        
-        # 分发模型
-        model = load_checkpoint_and_dispatch(
-            model,
-            MODEL_NAME,
-            device_map=DEVICE_MAP,
-            max_memory=max_memory,
-            no_split_module_classes=["QwenBlock"],
-            dtype=torch.float16
-        )
+        print(f"MoE模型加载失败，尝试普通Qwen3VL方案: {e}")
+        # 方式2：备用方案（适配旧版transformers/普通Qwen3VL模型）
+        try:
+            from transformers import Qwen3VLForConditionalGeneration
+            from accelerate import load_checkpoint_and_dispatch, init_empty_weights
+            
+            # 先获取配置
+            config = Qwen3VLForConditionalGeneration.config_class.from_pretrained(MODEL_NAME)
+            
+            # 初始化空模型
+            with init_empty_weights():
+                model = Qwen3VLForConditionalGeneration(config)
+            
+            # 分发模型
+            model = load_checkpoint_and_dispatch(
+                model,
+                MODEL_NAME,
+                device_map=DEVICE_MAP,
+                max_memory=max_memory,
+                no_split_module_classes=["QwenBlock"],
+                dtype=torch.float16
+            )
+        except Exception as e2:
+            raise Exception(f"所有模型加载方案均失败：{e2}")
     
     # 5. 设置推理模式
     model.eval()
