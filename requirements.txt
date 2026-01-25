@@ -1,6 +1,5 @@
 # 基础依赖
-python==3.10
-torch==2.2.1+cu121
+torch==2.2.1
 transformers==4.38.2
 accelerate==0.27.2
 fastapi==0.110.0
