@@ -8,8 +8,12 @@ from contextlib import asynccontextmanager
 from PIL import Image
 import torch
 from fastapi import FastAPI, Request, HTTPException
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
+import asyncio
 from pydantic import BaseModel
+import threading
+from queue import Queue, Empty  # 这行是缺失的关键导入
+from transformers import TextStreamer  # 导入原生Streamer
 
 # 忽略所有警告
 warnings.filterwarnings("ignore")
@@ -242,6 +246,218 @@ async def create_chat_completion(request: ChatCompletionRequest):
         raise e
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"推理失败：{str(e)}")
+
+# ====================== 优化的Qwen流式处理器（解决逐字碎片化+标准SSE格式） ======================
+class QwenVLStreamer(TextStreamer):
+    def __init__(self, processor, queue: Queue, stop_event: threading.Event, skip_prompt: bool = True):
+        super().__init__(processor.tokenizer, skip_prompt=skip_prompt)
+        self.processor = processor
+        self.queue = queue
+        self.stop_event = stop_event
+        self.chat_id = f"chat-{torch.randint(100000, 999999, (1,)).item()}"
+        self.created_time = int(datetime.datetime.now().timestamp())
+        self.prompt_length = 0
+        # 缓存字符，凑成词/短句再输出（解决逐字碎片化）
+        self.char_buffer = ""
+        # 中文分词分隔符（遇到这些符号就输出缓存）
+        self.separators = re.compile(r"[，。！？；：、\n]")
+
+    def on_finalized_text(self, text: str, stream_end: bool = False):
+        if self.stop_event.is_set():
+            return
+        
+        # 跳过prompt部分
+        if self.skip_prompt and self.prompt_length == 0:
+            self.prompt_length = len(text)
+            return
+        
+        if stream_end:
+            # 输出剩余缓存
+            if self.char_buffer.strip():
+                self.send_chunk(self.char_buffer.strip())
+            # 发送结束标记
+            final_chunk = {
+                "id": self.chat_id,
+                "object": "chat.completion.chunk",
+                "created": self.created_time,
+                "model": MODEL_NAME,
+                "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]
+            }
+            # 标准SSE格式：data: + JSON字符串 + \n\n
+            self.queue.put(f"data: {json.dumps(final_chunk, ensure_ascii=False)}\n\n", timeout=1.0)
+            return
+        
+        # 只处理新增的生成内容
+        if self.skip_prompt and len(text) > self.prompt_length:
+            new_text = text[self.prompt_length:]
+            self.prompt_length = len(text)
+        else:
+            new_text = text
+
+        if not new_text:
+            return
+        
+        # 字符缓存逻辑：凑成词/短句再输出
+        self.char_buffer += new_text
+        # 检查是否遇到分隔符
+        match = self.separators.search(self.char_buffer)
+        if match:
+            # 分割缓存：分隔符前的内容 + 分隔符 + 剩余内容
+            split_pos = match.end()
+            output_text = self.char_buffer[:split_pos]
+            self.char_buffer = self.char_buffer[split_pos:]
+            self.send_chunk(output_text)
+
+    def send_chunk(self, text: str):
+        """发送标准SSE格式的数据块"""
+        if not text:
+            return
+        chunk = {
+            "id": self.chat_id,
+            "object": "chat.completion.chunk",
+            "created": self.created_time,
+            "model": MODEL_NAME,
+            "choices": [{"index": 0, "delta": {"content": text}, "finish_reason": None}]
+        }
+        # 核心修复：生成标准SSE格式字符串
+        sse_data = f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
+        try:
+            self.queue.put(sse_data, timeout=1.0)
+        except:
+            pass
+
+# ====================== API接口：保持原有逻辑，无需修改 ======================
+@app.post("/v1/chat/completions/stream")
+async def create_chat_completion_stream(request: ChatCompletionRequest):
+    try:
+        # 基础验证
+        if not request.messages or request.messages[-1].role != "user":
+            raise HTTPException(status_code=400, detail="最后一条消息必须是user角色")
+        
+        # 提取文本和图片
+        user_content = request.messages[-1].content
+        text_prompt = ""
+        images = []
+        
+        for item in user_content:
+            if item.type == "text" and item.text:
+                text_prompt = item.text
+            elif item.type == "image_url" and item.image_url:
+                images.append(parse_image_from_base64(item.image_url.url))
+        
+        if not text_prompt:
+            raise HTTPException(status_code=400, detail="必须提供文本提问")
+        
+        # 构造Qwen格式的消息
+        qwen_messages = [{
+            "role": "user",
+            "content": []
+        }]
+        for img in images:
+            qwen_messages[0]["content"].append({"type": "image", "image": img})
+        qwen_messages[0]["content"].append({"type": "text", "text": text_prompt})
+
+        # 生成Qwen3-VL标准的文本模板
+        text_template = processor.apply_chat_template(
+            qwen_messages,
+            tokenize=False,
+            add_generation_prompt=True
+        )
+
+        # 处理输入：文本+图片
+        inputs = processor(
+            text=text_template,
+            images=images if images else None,
+            return_tensors="pt",
+            padding=True,
+            truncation=True,
+            max_length=MAX_TOKENS
+        )
+
+        # 设备适配
+        for k, v in inputs.items():
+            if torch.is_tensor(v):
+                inputs[k] = v.to(model.device if hasattr(model, 'device') else "cuda:0")
+        
+        # 流式生成准备
+        result_queue = Queue(maxsize=50)
+        stop_event = threading.Event()
+        streamer = QwenVLStreamer(processor, result_queue, stop_event, skip_prompt=True)
+        
+        # 同步生成函数
+        def generate_with_streamer():
+            try:
+                with torch.no_grad():
+                    model.generate(
+                        **inputs,
+                        max_new_tokens=request.max_tokens,
+                        temperature=request.temperature,
+                        top_p=0.8,
+                        repetition_penalty=1.1,
+                        do_sample=True,
+                        pad_token_id=processor.tokenizer.pad_token_id or 151643,
+                        eos_token_id=processor.tokenizer.eos_token_id or 151643,
+                        streamer=streamer,
+                        use_cache=True,
+                        num_beams=1,
+                        length_penalty=1.0
+                    )
+            except Exception as e:
+                import traceback
+                error_detail = f"{str(e)}\n{traceback.format_exc()}"
+                print(f"生成出错: {error_detail}")
+                error_resp = {
+                    "error": {"message": str(e), "type": "streaming_error", "param": None, "code": 500}
+                }
+                result_queue.put(f"data: {json.dumps(error_resp, ensure_ascii=False)}\n\n", timeout=1.0)
+            finally:
+                result_queue.put("[DONE]", timeout=1.0)
+                stop_event.set()
+        
+        # 异步生成器：直接返回队列中的SSE格式数据
+        async def stream_generator():
+            gen_thread = threading.Thread(target=generate_with_streamer, daemon=True)
+            gen_thread.start()
+            
+            try:
+                while True:
+                    try:
+                        chunk = result_queue.get(timeout=0.1)
+                        if chunk == "[DONE]":
+                            break
+                        # 直接yield标准SSE格式的字符串
+                        yield chunk
+                    except Empty:
+                        if not gen_thread.is_alive() and result_queue.empty():
+                            break
+                        await asyncio.sleep(0.01)
+                        continue
+            finally:
+                stop_event.set()
+                try:
+                    gen_thread.join(timeout=2.0)
+                except:
+                    pass
+        
+        # 返回流式响应，指定媒体类型为text/event-stream
+        return StreamingResponse(
+            stream_generator(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no",
+                "Content-Type": "text/event-stream; charset=utf-8"
+            }
+        )
+    
+    except HTTPException as e:
+        raise e
+    except Exception as e:
+        import traceback
+        error_detail = f"{str(e)}\n{traceback.format_exc()}"
+        print(f"流式接口错误: {error_detail}")
+        raise HTTPException(status_code=500, detail=f"流式推理失败：{str(e)}")
 
 # ====================== 健康检查 ======================
 @app.get("/health")
