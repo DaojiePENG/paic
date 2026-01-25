@@ -14,14 +14,56 @@ from pydantic import BaseModel
 import threading
 from queue import Queue, Empty  # 这行是缺失的关键导入
 from transformers import TextStreamer  # 导入原生Streamer
+import argparse  # 新增：导入命令行参数解析模块
+import re  # 补充：QwenVLStreamer中用到但未导入的模块
 
 # 忽略所有警告
 warnings.filterwarnings("ignore")
 
-# ====================== 核心配置 ======================
-MODEL_NAME = "Qwen/Qwen3-VL-2B-Instruct"
-DEVICE_MAP = "auto"
-MAX_TOKENS = 2048
+# ====================== 解析命令行参数 ======================
+# 创建参数解析器
+parser = argparse.ArgumentParser(description="Qwen3-VL OpenAI-Compatible API Server")
+# 添加配置参数（带默认值，保持原有默认配置）
+parser.add_argument(
+    "--model-name", 
+    type=str, 
+    default="Qwen/Qwen3-VL-2B-Instruct",
+    help="模型名称或本地路径 (默认: Qwen/Qwen3-VL-2B-Instruct)"
+)
+parser.add_argument(
+    "--device-map", 
+    type=str, 
+    default="auto",
+    help="设备映射配置 (默认: auto)"
+)
+parser.add_argument(
+    "--max-tokens", 
+    type=int, 
+    default=2048,
+    help="最大输入token数 (默认: 2048)"
+)
+parser.add_argument(
+    "--port", 
+    type=int, 
+    default=8000,
+    help="服务端口 (默认: 8000)"
+)
+parser.add_argument(
+    "--host", 
+    type=str, 
+    default="0.0.0.0",
+    help="服务监听地址 (默认: 0.0.0.0)"
+)
+
+# 解析参数
+args = parser.parse_args()
+
+# ====================== 核心配置（从命令行参数读取） ======================
+MODEL_NAME = args.model_name
+DEVICE_MAP = args.device_map
+MAX_TOKENS = args.max_tokens
+SERVER_HOST = args.host
+SERVER_PORT = args.port
 
 # ====================== 生命周期管理 ======================
 @asynccontextmanager
@@ -475,8 +517,8 @@ if __name__ == "__main__":
     import uvicorn
     uvicorn.run(
         app="server:app",
-        host="0.0.0.0",
-        port=8000,
+        host=SERVER_HOST,  # 使用命令行参数
+        port=SERVER_PORT,  # 使用命令行参数
         workers=1,
         log_level="info",
         reload=False
