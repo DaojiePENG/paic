@@ -16,6 +16,7 @@ RUN apt update && apt install -y \
     python3-pip git wget \
     && ln -s /usr/bin/python3.10 /usr/bin/python \
     && rm -rf /var/lib/apt/lists/*
+RUN apt-get install -y portaudio19-dev
 
 # 验证Python版本
 RUN python --version | grep -q "3.10" || (echo "Python version is not 3.10" && exit 1)

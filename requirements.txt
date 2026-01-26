@@ -12,3 +12,9 @@ pydantic==2.6.1
 python-multipart==0.0.9
 requests==2.31.0
 numpy==1.26.4
+# 音频处理相关
+soundfile 
+pydub 
+sounddevice 
+pyaudio 
+uvloop
