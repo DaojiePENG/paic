@@ -66,6 +66,28 @@ def batchify_sentences(sentences: List[str], batch_size: int) -> List[List[str]]
         batches.append(batch)
     return batches
 
+# 新增：封装确定性推理函数（解决lambda赋值语法错误）
+def deterministic_tts_inference(batch_text, batch_language, batch_speaker, batch_instruct):
+    """
+    封装确定性TTS推理逻辑，避免lambda内赋值语法错误
+    """
+    # 固定所有随机种子和CUDA配置
+    torch.manual_seed(42)
+    torch.cuda.manual_seed_all(42)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    # 调用模型（修正参数：do_sample=False+极小temperature，实现无随机生成）
+    return model.generate_custom_voice(
+        text=batch_text,
+        language=batch_language,
+        speaker=batch_speaker,
+        instruct=batch_instruct,
+        temperature=1e-6,  # 极小正数，满足模型参数校验
+        top_p=1.0,         # 仅取最可能结果
+        do_sample=False,   # 核心：关闭采样，启用贪心解码（无随机性）
+        use_deterministic_sampling=True
+    )
+
 async def real_time_tts_generator(
     text: str,
     language: str = "Chinese",
@@ -105,15 +127,15 @@ async def real_time_tts_generator(
             batch_speaker = [speaker] * len(batch)
             batch_instruct = [instruct] * len(batch)
 
-            # 异步批量推理（避免阻塞事件循环）
+            # 异步批量推理（调用封装的确定性函数，解决语法错误）
             loop = asyncio.get_event_loop()
             wavs, sr = await loop.run_in_executor(
                 None,
-                lambda: model.generate_custom_voice(
-                    text=batch_text,
-                    language=batch_language,
-                    speaker=batch_speaker,
-                    instruct=batch_instruct,
+                lambda: deterministic_tts_inference(
+                    batch_text=batch_text,
+                    batch_language=batch_language,
+                    batch_speaker=batch_speaker,
+                    batch_instruct=batch_instruct
                 )
             )
 
@@ -140,7 +162,10 @@ async def real_time_tts_generator(
     except ValueError as ve:
         raise HTTPException(status_code=400, detail=f"输入参数错误: {str(ve)}")
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"流式生成失败: {str(e)}")
+        # 捕获模型推理异常，避免响应已启动后抛错
+        error_msg = f"流式生成失败: {str(e)}"
+        print(error_msg)
+        raise HTTPException(status_code=500, detail=error_msg)
 
 # ====================== API 接口 ======================
 @app.post("/tts/stream", summary="低延迟流式语音（Batch优化版）")
@@ -172,20 +197,33 @@ async def stream_audio_api(request: TTSRequest):
 
 @app.post("/tts/full", summary="完整语音生成（对比测试）")
 async def generate_full_audio_api(request: TTSRequest):
-    wavs, sr = model.generate_custom_voice(
-        text=request.text,
-        language=request.language,
-        speaker=request.speaker,
-        instruct=request.instruct,
-    )
-    buffer = io.BytesIO()
-    sf.write(buffer, wavs[0], sr, format='WAV')
-    buffer.seek(0)
-    return Response(
-        content=buffer.read(),
-        media_type="audio/wav",
-        headers={"Content-Disposition": "attachment; filename=tts_full.wav"}
-    )
+    """完整语音生成接口（确定性配置）"""
+    try:
+        # 彻底固定所有随机因素，确保完整生成的音色100%一致
+        torch.manual_seed(42)
+        torch.cuda.manual_seed_all(42)
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+        wavs, sr = model.generate_custom_voice(
+            text=request.text,
+            language=request.language,
+            speaker=request.speaker,
+            instruct=request.instruct,
+            temperature=1e-6,  # 极小正数，满足参数校验
+            top_p=1.0,         # 无随机采样
+            do_sample=False,   # 贪心解码，确保结果唯一
+            use_deterministic_sampling=True
+        )
+        buffer = io.BytesIO()
+        sf.write(buffer, wavs[0], sr, format='WAV')
+        buffer.seek(0)
+        return Response(
+            content=buffer.read(),
+            media_type="audio/wav",
+            headers={"Content-Disposition": "attachment; filename=tts_full.wav"}
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"完整语音生成失败: {str(e)}")
 
 @app.get("/health")
 async def health_check():
