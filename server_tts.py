@@ -1,18 +1,19 @@
+import os
+os.environ["HF_HOME"] = "/mnt/slurmfs-A100_msp/user_data/dpeng108/data/huggingface_cache"
 import torch
 import soundfile as sf
 from qwen_tts import Qwen3TTSModel
-import os
 import io
 import asyncio
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import StreamingResponse, Response
 from pydantic import BaseModel
 import uvicorn
-from typing import Optional, AsyncGenerator
+# 修复：补充完整的typing导入（关键）
+from typing import AsyncGenerator, List, Optional
 import re
 
 # ====================== 初始化配置 ======================
-os.environ["HF_HOME"] = "/mnt/slurmfs-A100_msp/user_data/dpeng108/data/huggingface_cache"
 
 # 初始化 TTS 模型（全局加载）
 print("正在加载 Qwen3-TTS 模型...")
@@ -34,6 +35,7 @@ class TTSRequest(BaseModel):
     instruct: str = ""
     sentence_split: bool = True  # 是否开启短句分片
     chunk_ms: int = 20  # 每块音频时长（ms）
+    batch_size: int = 2  # 批量推理的句子数量（可根据GPU显存调整）
 
 # ====================== 核心工具函数 ======================
 def split_long_text(text: str) -> list:
@@ -54,75 +56,100 @@ def split_long_text(text: str) -> list:
             result.append(sentences[i])
     return [s.strip() for s in result if s.strip()]
 
+def batchify_sentences(sentences: List[str], batch_size: int) -> List[List[str]]:
+    """
+    将切分后的短句列表按batch_size分组，生成批量推理的批次
+    """
+    batches = []
+    for i in range(0, len(sentences), batch_size):
+        batch = sentences[i:i+batch_size]
+        batches.append(batch)
+    return batches
+
 async def real_time_tts_generator(
     text: str,
     language: str = "Chinese",
     speaker: str = "Vivian",
     instruct: str = "甜美女声",
     sentence_split: bool = True,
-    chunk_ms: int = 20
+    chunk_ms: int = 20,
+    batch_size: int = 4
 ) -> AsyncGenerator[bytes, None]:
     """
-    真正的低延迟流式生成器：
+    优化版低延迟流式生成器：
     1. 长文本切分为短句
-    2. 逐句推理，生成一句推送一句
-    3. 每句音频再按时间分片，零缓冲推送
+    2. 短句按批次批量推理（提升GPU利用率）
+    3. 逐句/逐片推送音频，保持低延迟
+    4. 每句音频再按时间分片，零缓冲推送
     """
     try:
         # 1. 切分长文本为短句
         if sentence_split:
             sentences = split_long_text(text)
+            if not sentences:
+                raise ValueError("切分后无有效文本内容")
         else:
             sentences = [text]
-        
+
         sample_rate = model.sample_rate if hasattr(model, "sample_rate") else 16000
         chunk_samples = int(sample_rate * chunk_ms / 1000)  # 每块的采样点数
 
-        # 2. 逐句推理 + 实时推送
-        for sent in sentences:
-            if not sent:
-                continue
-            
-            # 异步推理单句（避免阻塞事件循环）
+        # 2. 将短句列表按batch_size分组
+        sentence_batches = batchify_sentences(sentences, batch_size)
+
+        # 3. 逐批次推理 + 实时推送
+        for batch in sentence_batches:
+            # 构造批量推理的参数（每个句子使用相同的speaker/language/instruct）
+            batch_text = batch
+            batch_language = [language] * len(batch)
+            batch_speaker = [speaker] * len(batch)
+            batch_instruct = [instruct] * len(batch)
+
+            # 异步批量推理（避免阻塞事件循环）
             loop = asyncio.get_event_loop()
             wavs, sr = await loop.run_in_executor(
                 None,
                 lambda: model.generate_custom_voice(
-                    text=sent,
-                    language=language,
-                    speaker=speaker,
-                    instruct=instruct,
+                    text=batch_text,
+                    language=batch_language,
+                    speaker=batch_speaker,
+                    instruct=batch_instruct,
                 )
             )
-            audio_data = wavs[0]
-            current_pos = 0
-            total_samples = len(audio_data)
 
-            # 3. 单句音频按时间分片，零缓冲推送
-            while current_pos < total_samples:
-                end_pos = min(current_pos + chunk_samples, total_samples)
-                audio_chunk = audio_data[current_pos:end_pos]
-                current_pos = end_pos
+            # 4. 处理当前批次的所有音频结果（按句子顺序）
+            for audio_data in wavs:
+                current_pos = 0
+                total_samples = len(audio_data)
 
-                # 转为 WAV 字节（不封装成完整 WAV，只传裸 PCM 会更高效，这里兼容播放）
-                buffer = io.BytesIO()
-                sf.write(buffer, audio_chunk, sr, format='WAV')
-                buffer.seek(0)
-                yield buffer.read()
+                # 单句音频按时间分片，零缓冲推送
+                while current_pos < total_samples:
+                    end_pos = min(current_pos + chunk_samples, total_samples)
+                    audio_chunk = audio_data[current_pos:end_pos]
+                    current_pos = end_pos
 
-                # 关键：匹配播放速度，不额外加延迟
-                await asyncio.sleep(0)
+                    # 转为WAV字节（兼容播放，裸PCM可进一步优化）
+                    buffer = io.BytesIO()
+                    sf.write(buffer, audio_chunk, sr, format='WAV')
+                    buffer.seek(0)
+                    yield buffer.read()
 
+                    # 匹配播放速度，无额外延迟
+                    await asyncio.sleep(0)
+
+    except ValueError as ve:
+        raise HTTPException(status_code=400, detail=f"输入参数错误: {str(ve)}")
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"流式生成失败: {str(e)}")
 
 # ====================== API 接口 ======================
-@app.post("/tts/stream", summary="低延迟流式语音（推荐）")
+@app.post("/tts/stream", summary="低延迟流式语音（Batch优化版）")
 async def stream_audio_api(request: TTSRequest):
     """
-    低延迟流式语音接口：
-    - 长文本自动分句，逐句生成推送
-    - 零缓冲传输，无额外延迟
+    低延迟流式语音接口（Batch优化版）：
+    - 长文本自动分句，按批次批量推理（提升效率）
+    - 逐句/逐片推送音频，保持零缓冲低延迟
+    - 可自定义batch_size适配GPU显存
     """
     return StreamingResponse(
         real_time_tts_generator(
@@ -131,13 +158,15 @@ async def stream_audio_api(request: TTSRequest):
             speaker=request.speaker,
             instruct=request.instruct,
             sentence_split=request.sentence_split,
-            chunk_ms=request.chunk_ms
+            chunk_ms=request.chunk_ms,
+            batch_size=request.batch_size
         ),
         media_type="audio/wav",
         headers={
             "Transfer-Encoding": "chunked",
             "Connection": "keep-alive",
-            "X-Accel-Buffering": "no"  # 禁用 nginx 缓冲（如果有反向代理）
+            "X-Accel-Buffering": "no",  # 禁用nginx缓冲
+            "X-Content-Type-Options": "nosniff"
         }
     )
 
